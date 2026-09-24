@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ESP8266 Smart CCTV</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:Inter,system-ui,sans-serif; background:#070b12; color:#e8eef7; }
+    .wrap { max-width:1200px; margin:auto; padding:24px; }
+    header { display:flex; justify-content:space-between; gap:16px; align-items:center; margin-bottom:18px; }
+    h1 { margin:0; font-size:25px; } .sub { color:#8996a8; font-size:13px; margin-top:4px; }
+    .grid { display:grid; grid-template-columns:2fr 1fr; gap:18px; }
+    .card { background:#0d131d; border:1px solid #1d2838; border-radius:16px; padding:16px; box-shadow:0 12px 35px #0005; }
+    .camera { position:relative; background:#000; border-radius:12px; overflow:hidden; aspect-ratio:16/9; }
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+    .topbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
+    button,input { border:1px solid #2a374a; background:#111a27; color:#fff; border-radius:9px; padding:10px 12px; }
+    button { cursor:pointer; font-weight:700; } button.primary { background:#1677ff; border-color:#1677ff; }
+    button.danger { background:#b42318; border-color:#b42318; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    label { display:block; font-size:12px; color:#9aa8bb; margin:12px 0 6px; }
+    input { width:100%; }
+    .status { display:flex; align-items:center; gap:9px; font-size:13px; margin:10px 0; }
+    .dot { width:10px; height:10px; border-radius:50%; background:#667085; }
+    .ok { background:#22c55e; } .warn { background:#f59e0b; } .bad { background:#ef4444; }
+    .metric { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:14px; }
+    .metric div { background:#111a27; padding:12px; border-radius:10px; }
+    .metric b { display:block; font-size:20px; margin-top:4px; }
+    #log { height:190px; overflow:auto; background:#070b12; border-radius:10px; padding:10px; font:12px ui-monospace,monospace; color:#9fb0c6; }
+    .hint { color:#7f8da0; font-size:12px; line-height:1.5; }
+    @media(max-width:850px){ .grid{grid-template-columns:1fr;} }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div><h1>Smart CCTV • ESP8266 Relay</h1><div class="sub">Browser camera + person detection + Wi‑Fi relay trigger</div></div>
+    <div class="status"><span id="camDot" class="dot"></span><span id="camStatus">Camera stopped</span></div>
+  </header>
+
+  <div class="grid">
+    <section class="card">
+      <div class="topbar">
+        <button id="start" class="primary">Start CCTV</button>
+        <button id="stop">Stop</button>
+        <button id="test" disabled>Test Relay</button>
+      </div>
+      <div class="camera">
+        <video id="video" autoplay muted playsinline></video>
+        <canvas id="overlay"></canvas>
+      </div>
+      <div class="metric">
+        <div>Detection <b id="detection">NONE</b></div>
+        <div>Confidence <b id="confidence">0%</b></div>
+      </div>
+    </section>
+
+    <aside class="card">
+      <h3 style="margin-top:0">ESP8266</h3>
+      <label for="espIp">ESP8266 address</label>
+      <input id="espIp" value="192.168.1.50" placeholder="192.168.1.50">
+      <label for="relayMs">Relay ON time (ms)</label>
+      <input id="relayMs" type="number" min="100" max="60000" value="3000">
+      <label for="threshold">Person confidence (%)</label>
+      <input id="threshold" type="number" min="10" max="99" value="60">
+      <label for="cooldown">Trigger cooldown (seconds)</label>
+      <input id="cooldown" type="number" min="1" max="300" value="10">
+      <div class="status"><span id="espDot" class="dot"></span><span id="espStatus">Not tested</span></div>
+      <button id="connect" style="width:100%">Test ESP8266</button>
+      <p class="hint">Use the ESP8266's local IP. Your browser and ESP8266 should be on the same Wi‑Fi network. Camera access normally requires HTTPS or localhost.</p>
+      <h3>Event log</h3>
+      <div id="log"></div>
+    </aside>
+  </div>
+</div>
+
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('overlay');
+const ctx = canvas.getContext('2d');
+const logEl = document.getElementById('log');
+let stream = null, model = null, running = false, lastTrigger = 0, busy = false;
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  logEl.innerHTML = `<div>[${t}] ${msg}</div>` + logEl.innerHTML;
+}
+function setDot(id, state, text) {
+  const d = document.getElementById(id); d.className = 'dot ' + state;
+  if (text) d.nextElementSibling.textContent = text;
+}
+function espBase() {
+  let ip = document.getElementById('espIp').value.trim();
+  ip = ip.replace(/^https?:\\/\\//,'').replace(/\\/$/,'');
+  return 'http://' + ip;
+}
+async function esp(path) {
+  const url = espBase() + path;
+  const r = await fetch(url, {method:'GET', mode:'cors', cache:'no-store'});
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.text();
+}
+async function testEsp() {
+  setDot('espDot','warn','Testing…');
+  try {
+    await esp('/status');
+    setDot('espDot','ok','ESP8266 connected');
+    document.getElementById('test').disabled = false;
+    log('ESP8266 connection OK');
+  } catch(e) {
+    setDot('espDot','bad','ESP8266 unreachable');
+    log('ESP8266 error: ' + e.message);
+  }
+}
+async function triggerRelay(reason='person detected') {
+  const now = Date.now();
+  const cooldown = Number(document.getElementById('cooldown').value) * 1000;
+  if (now - lastTrigger < cooldown || busy) return;
+  busy = true; lastTrigger = now;
+  const ms = Number(document.getElementById('relayMs').value);
+  try {
+    await esp('/relay/on?ms=' + encodeURIComponent(ms));
+    log('Relay triggered (' + reason + ', ' + ms + ' ms)');
+  } catch(e) {
+    log('Relay trigger failed: ' + e.message);
+    setDot('espDot','bad','ESP8266 unreachable');
+  } finally { busy = false; }
+}
+async function detectLoop() {
+  if (!running || !model) return;
+  if (video.readyState >= 2) {
+    const predictions = await model.detect(video);
+    canvas.width = video.videoWidth || 640; canvas.height = video.videoHeight || 360;
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    const threshold = Number(document.getElementById('threshold').value)/100;
+    const persons = predictions.filter(p => p.class === 'person' && p.score >= threshold);
+    if (persons.length) {
+      const p = persons[0], [x,y,w,h] = p.bbox;
+      ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 4; ctx.strokeRect(x,y,w,h);
+      ctx.fillStyle = '#22c55e'; ctx.font = '18px system-ui';
+      ctx.fillText('PERSON ' + Math.round(p.score*100) + '%', x, Math.max(22,y-6));
+      document.getElementById('detection').textContent = 'PERSON';
+      document.getElementById('confidence').textContent = Math.round(p.score*100) + '%';
+      await triggerRelay();
+    } else {
+      document.getElementById('detection').textContent = 'NONE';
+      document.getElementById('confidence').textContent = '0%';
+    }
+  }
+  requestAnimationFrame(detectLoop);
+}
+async function start() {
+  if (running) return;
+  try {
+    setDot('camDot','warn','Requesting camera…');
+    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
+    video.srcObject = stream; await video.play();
+    setDot('camDot','ok','Camera active'); running = true;
+    document.getElementById('test').disabled = false;
+    log('Camera started');
+    if (!model) { log('Loading person-detection model…'); model = await cocoSsd.load(); log('Model ready'); }
+    detectLoop();
+  } catch(e) {
+    setDot('camDot','bad','Camera permission/error');
+    log('Camera error: ' + e.message);
+  }
+}
+function stop() {
+  running = false;
+  if (stream) stream.getTracks().forEach(t=>t.stop());
+  video.srcObject = null; ctx.clearRect(0,0,canvas.width,canvas.height);
+  setDot('camDot','','Camera stopped'); log('Camera stopped');
+}
+document.getElementById('start').onclick = start;
+document.getElementById('stop').onclick = stop;
+document.getElementById('connect').onclick = testEsp;
+document.getElementById('test').onclick = () => triggerRelay('manual test');
+window.addEventListener('beforeunload', stop);
+</script>
+</body>
+</html>
